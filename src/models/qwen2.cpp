@@ -6,25 +6,21 @@ llm_build_qwen2::llm_build_qwen2(const llama_model & model, const llm_graph_para
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
     GGML_ASSERT(n_embd_head == n_rot);
 
-    ggml_tensor * cur;
-    ggml_tensor * inpL;
-
-    inpL = build_inp_embd(model.tok_embd);
-
-    // inp_pos - contains the positions
-    ggml_tensor * inp_pos = build_inp_pos();
-
-    auto * inp_attn = build_attn_inp_kv();
-
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
-
     // IntelNav layer-range extensions. See llama-graph.h for field docs.
     const int32_t il_start = params.layer_start;
     const int32_t il_end   = params.layer_end >= 0
                                  ? params.layer_end
                                  : (int32_t) n_layer;
+    const bool own_last_layer = (il_end == (int32_t) n_layer);
 
-    // Embed-only path: skip the layer loop and return raw embeddings.
+    ggml_tensor * cur;
+    ggml_tensor * inpL;
+
+    inpL = build_inp_embd(model.tok_embd);
+
+    // Embed-only path: skip positions/attention/out_ids inputs, no layers,
+    // no head. Every other registered input would be allocated but never
+    // used by the computed graph, which the scheduler treats as an error.
     if (il_end == il_start && !params.run_head) {
         cb(inpL, "result_embd_only", -1);
         res->t_embd = inpL;
@@ -32,10 +28,23 @@ llm_build_qwen2::llm_build_qwen2(const llama_model & model, const llm_graph_para
         return;
     }
 
-    // Head-only path: skip the layer loop, apply output_norm + lm_head
-    // to the caller-supplied hidden state that entered via build_inp_embd.
+    // Head-only path: skip pos/attn inputs, no layer loop. Apply
+    // output_norm + lm_head to the caller-supplied hidden state. We
+    // DO register inp_out_ids — when the caller sets batch.logits on
+    // fewer than all positions (n_outputs < n_tokens), the context's
+    // logits-extraction reads n_outputs * n_vocab floats from the
+    // start of t_logits, so t_logits must be compacted to exactly
+    // those positions. This mirrors the final-layer optimization in
+    // the stock full-forward path.
     if (il_end == il_start && params.run_head) {
-        ggml_tensor * h = build_norm(inpL,
+        ggml_tensor * inp_out_ids = build_inp_out_ids();
+
+        ggml_tensor * cur = inpL;
+        if (inp_out_ids) {
+            cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+        }
+
+        ggml_tensor * h = build_norm(cur,
                 model.output_norm, NULL,
                 LLM_NORM_RMS, -1);
         cb(h, "result_norm", -1);
@@ -51,6 +60,16 @@ llm_build_qwen2::llm_build_qwen2(const llama_model & model, const llm_graph_para
         ggml_build_forward_expand(gf, logits);
         return;
     }
+
+    // inp_pos - contains the positions
+    ggml_tensor * inp_pos = build_inp_pos();
+
+    auto * inp_attn = build_attn_inp_kv();
+
+    // Only register the output-selection input when we actually own the
+    // last layer (its consumer is gated on `own_last_layer` below). For
+    // middle-peer partial ranges this input would otherwise be an orphan.
+    ggml_tensor * inp_out_ids = own_last_layer ? build_inp_out_ids() : nullptr;
 
     for (int il = il_start; il < il_end; ++il) {
         ggml_tensor * inpSA = inpL;
@@ -89,8 +108,8 @@ llm_build_qwen2::llm_build_qwen2(const llama_model & model, const llm_graph_para
         }
         // Only apply the final-layer output-selection optimization when
         // the pipeline owns the true last layer. Middle peers must emit
-        // every position's hidden state.
-        if (il == (int32_t) n_layer - 1 && il_end == (int32_t) n_layer && inp_out_ids) {
+        // every position's hidden state (inp_out_ids is nullptr there).
+        if (il == (int32_t) n_layer - 1 && own_last_layer && inp_out_ids) {
             cur   = ggml_get_rows(ctx0,   cur, inp_out_ids);
             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
         }
@@ -121,9 +140,20 @@ llm_build_qwen2::llm_build_qwen2(const llama_model & model, const llm_graph_para
     }
     cur = inpL;
 
-    // Partial-range peer: return raw hidden state, skip norm + head.
-    if (il_end < (int32_t) n_layer) {
+    // Partial-range peer: return pre-norm post-layer hidden state, skip
+    // norm + head. The final output_norm is owned by the head_only call
+    // at the end of the chain — applying it here would double-norm.
+    if (!own_last_layer) {
         cb(cur, "result_embd_partial", -1);
+        res->t_embd = cur;
+        ggml_build_forward_expand(gf, cur);
+        return;
+    }
+
+    // Last peer without head: same semantics as the middle peer — expose
+    // pre-norm hidden state, let head_only apply norm + lm_head downstream.
+    if (!params.run_head) {
+        cb(cur, "result_embd_prehead", -1);
         res->t_embd = cur;
         ggml_build_forward_expand(gf, cur);
         return;
@@ -135,12 +165,6 @@ llm_build_qwen2::llm_build_qwen2(const llama_model & model, const llm_graph_para
 
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
-
-    if (!params.run_head) {
-        // Last peer without head: pass the post-norm hidden state along.
-        ggml_build_forward_expand(gf, cur);
-        return;
-    }
 
     // lm_head
     cur = build_lora_mm(model.output, cur);

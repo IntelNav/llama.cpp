@@ -7,34 +7,19 @@ llm_build_llama<embed>::llm_build_llama(const llama_model & model, const llm_gra
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
     GGML_ASSERT(n_embd_head == n_rot);
 
-    ggml_tensor * cur;
-    ggml_tensor * inpL;
-
-    inpL = build_inp_embd(model.tok_embd);
-
-    // inp_pos - contains the positions
-    ggml_tensor * inp_pos = build_inp_pos();
-
-    using inp_attn_type = std::conditional_t<embed, llm_graph_input_attn_no_cache, llm_graph_input_attn_kv>;
-
-    inp_attn_type * inp_attn = nullptr;
-    if constexpr (embed) {
-        inp_attn = build_attn_inp_no_cache();
-    } else {
-        inp_attn = build_attn_inp_kv();
-    }
-
-    const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f/sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
-
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
-
     // IntelNav layer-range extensions. See llama-graph.h for field docs.
     const int32_t il_start = params.layer_start;
     const int32_t il_end   = params.layer_end >= 0
                                  ? params.layer_end
                                  : (int32_t) n_layer;
+    const bool own_last_layer = (il_end == (int32_t) n_layer);
 
-    // Embed-only path: skip the layer loop and return raw embeddings.
+    ggml_tensor * cur;
+    ggml_tensor * inpL;
+
+    inpL = build_inp_embd(model.tok_embd);
+
+    // Embed-only path: skip pos/attn/out_ids, no layers, no head.
     if (il_end == il_start && !params.run_head) {
         cb(inpL, "result_embd_only", -1);
         res->t_embd = inpL;
@@ -42,11 +27,19 @@ llm_build_llama<embed>::llm_build_llama(const llama_model & model, const llm_gra
         return;
     }
 
-    // Head-only path: skip the layer loop, apply output_norm (+ lm_head
-    // for the non-embed template variant) to the caller-supplied hidden
-    // state that entered via build_inp_embd.
+    // Head-only path: skip pos/attn; apply output_norm (+ lm_head for
+    // the non-embed template variant) to the caller-supplied hidden
+    // state. inp_out_ids is needed so t_logits/t_embd gets compacted
+    // to the positions the caller flagged in batch.logits.
     if (il_end == il_start && params.run_head) {
-        ggml_tensor * h = build_norm(inpL,
+        ggml_tensor * inp_out_ids = build_inp_out_ids();
+
+        ggml_tensor * h_in = inpL;
+        if (inp_out_ids) {
+            h_in = ggml_get_rows(ctx0, h_in, inp_out_ids);
+        }
+
+        ggml_tensor * h = build_norm(h_in,
                 model.output_norm, NULL,
                 LLM_NORM_RMS, -1);
         cb(h, "result_norm", -1);
@@ -62,6 +55,24 @@ llm_build_llama<embed>::llm_build_llama(const llama_model & model, const llm_gra
         }
         return;
     }
+
+    // inp_pos - contains the positions
+    ggml_tensor * inp_pos = build_inp_pos();
+
+    using inp_attn_type = std::conditional_t<embed, llm_graph_input_attn_no_cache, llm_graph_input_attn_kv>;
+
+    inp_attn_type * inp_attn = nullptr;
+    if constexpr (embed) {
+        inp_attn = build_attn_inp_no_cache();
+    } else {
+        inp_attn = build_attn_inp_kv();
+    }
+
+    const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f/sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
+
+    // Only register the output-selection input when we own the last
+    // layer. Middle peers must emit every position's hidden state.
+    ggml_tensor * inp_out_ids = own_last_layer ? build_inp_out_ids() : nullptr;
 
     for (int il = il_start; il < il_end; ++il) {
         ggml_tensor * inpSA = inpL;
@@ -113,9 +124,8 @@ llm_build_llama<embed>::llm_build_llama(const llama_model & model, const llm_gra
             cb(cur, "attn_out", il);
         }
         // Only apply the final-layer output-selection optimization when
-        // the pipeline owns the true last layer. Middle peers must emit
-        // every position's hidden state.
-        if (il == (int32_t) n_layer - 1 && il_end == (int32_t) n_layer && inp_out_ids) {
+        // the pipeline owns the true last layer.
+        if (il == (int32_t) n_layer - 1 && own_last_layer && inp_out_ids) {
             cur   = ggml_get_rows(ctx0,   cur, inp_out_ids);
             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
         }
@@ -172,9 +182,18 @@ llm_build_llama<embed>::llm_build_llama(const llama_model & model, const llm_gra
     }
     cur = inpL;
 
-    // Partial-range peer: return raw hidden state, skip norm + head.
-    if (il_end < (int32_t) n_layer) {
+    // Partial-range peer: return pre-norm hidden state.
+    if (!own_last_layer) {
         cb(cur, "result_embd_partial", -1);
+        res->t_embd = cur;
+        ggml_build_forward_expand(gf, cur);
+        return;
+    }
+
+    // Last peer without head: expose pre-norm hidden state so head_only
+    // (downstream) can apply norm + lm_head without double-norming.
+    if (!params.run_head) {
+        cb(cur, "result_embd_prehead", -1);
         res->t_embd = cur;
         ggml_build_forward_expand(gf, cur);
         return;
@@ -186,12 +205,6 @@ llm_build_llama<embed>::llm_build_llama(const llama_model & model, const llm_gra
 
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
-
-    if (!params.run_head) {
-        // Last peer without head: pass the post-norm hidden state along.
-        ggml_build_forward_expand(gf, cur);
-        return;
-    }
 
     if constexpr (!embed) {
         // lm_head

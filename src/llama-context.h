@@ -120,12 +120,14 @@ struct llama_context {
     int decode(const llama_batch & batch_inp);
 
     // IntelNav layer-range extensions.
-    // Run only layers [layer_start, layer_end) of the transformer; do
-    // not apply output_norm or lm_head. On success, per-position hidden
-    // state is available via get_embeddings_ith().
-    // batch.embd must be set (not batch.token) when layer_start > 0,
-    // i.e. the caller is supplying an already-embedded tensor.
-    int decode_layers(const llama_batch & batch_inp, int32_t layer_start, int32_t layer_end);
+    // Run only layers [layer_start, layer_end) of the transformer.
+    // When run_head=false (the normal P2P middle/tail-peer case), skip
+    // output_norm and lm_head; per-position pre-norm hidden state is
+    // available via get_embeddings_ith(). When run_head=true AND the
+    // range includes the last layer, apply output_norm + lm_head and
+    // expose logits via get_logits_ith(). batch.embd must be set (not
+    // batch.token) when layer_start > 0.
+    int decode_layers(const llama_batch & batch_inp, int32_t layer_start, int32_t layer_end, bool run_head);
 
     // Tokens -> embedding lookup only. No layers, no head.
     // Per-position embedding available via get_embeddings_ith().

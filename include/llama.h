@@ -977,7 +977,8 @@ extern "C" {
             struct llama_context * ctx,
               struct llama_batch   batch,
                      int32_t       layer_start,
-                     int32_t       layer_end);
+                     int32_t       layer_end,
+                     bool          run_head);
 
     LLAMA_API int32_t llama_head_only(
             struct llama_context * ctx,
