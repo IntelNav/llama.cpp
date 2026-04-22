@@ -31,8 +31,50 @@ llm_build_deepseek2::llm_build_deepseek2(const llama_model & model, const llm_gr
     ggml_tensor * cur;
     ggml_tensor * inpL;
 
+    int effective_n_layers = hparams.n_layer - hparams.nextn_predict_layers;
+
+    // IntelNav layer-range extensions. See llama-graph.h for field docs.
+    const int32_t il_start = params.layer_start;
+    const int32_t il_end   = params.layer_end >= 0
+                                 ? params.layer_end
+                                 : (int32_t) effective_n_layers;
+    const bool own_last_layer = (il_end == (int32_t) effective_n_layers);
+
     // {n_embd, n_tokens}
     inpL = build_inp_embd(model.tok_embd);
+
+    // Embed-only path: skip pos/attn/out_ids, no layers, no head.
+    if (il_end == il_start && !params.run_head) {
+        cb(inpL, "result_embd_only", -1);
+        res->t_embd = inpL;
+        ggml_build_forward_expand(gf, inpL);
+        return;
+    }
+
+    // Head-only path: skip pos/attn; apply output_norm + lm_head to the
+    // caller-supplied hidden state. inp_out_ids is needed so t_logits
+    // gets compacted to the positions the caller flagged in batch.logits.
+    if (il_end == il_start && params.run_head) {
+        ggml_tensor * inp_out_ids = build_inp_out_ids();
+
+        ggml_tensor * h_in = inpL;
+        if (inp_out_ids) {
+            h_in = ggml_get_rows(ctx0, h_in, inp_out_ids);
+        }
+
+        ggml_tensor * h = build_norm(h_in,
+                model.output_norm, NULL,
+                LLM_NORM_RMS, -1);
+        cb(h, "result_norm", -1);
+        res->t_embd = h;
+
+        ggml_tensor * logits = ggml_mul_mat(ctx0, model.output, h);
+        cb(logits, "result_output", -1);
+        res->t_logits = logits;
+
+        ggml_build_forward_expand(gf, logits);
+        return;
+    }
 
     // (optional) temperature tuning - used by mistral-large
     ggml_tensor * inp_attn_scale = nullptr;
@@ -46,40 +88,9 @@ llm_build_deepseek2::llm_build_deepseek2(const llama_model & model, const llm_gr
     auto * inp_attn_kv = !is_mla ? build_attn_inp_kv() : nullptr;
     auto * inp_attn_k  =  is_mla ? build_attn_inp_k()  : nullptr;
 
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
-
-    int effective_n_layers = hparams.n_layer - hparams.nextn_predict_layers;
-
-    // IntelNav layer-range extensions. See llama-graph.h for field docs.
-    const int32_t il_start = params.layer_start;
-    const int32_t il_end   = params.layer_end >= 0
-                                 ? params.layer_end
-                                 : (int32_t) effective_n_layers;
-
-    // Embed-only path: skip the layer loop and return raw embeddings.
-    if (il_end == il_start && !params.run_head) {
-        cb(inpL, "result_embd_only", -1);
-        res->t_embd = inpL;
-        ggml_build_forward_expand(gf, inpL);
-        return;
-    }
-
-    // Head-only path: skip the layer loop, apply output_norm + lm_head
-    // to the caller-supplied hidden state that entered via build_inp_embd.
-    if (il_end == il_start && params.run_head) {
-        ggml_tensor * h = build_norm(inpL,
-                model.output_norm, NULL,
-                LLM_NORM_RMS, -1);
-        cb(h, "result_norm", -1);
-        res->t_embd = h;
-
-        ggml_tensor * logits = ggml_mul_mat(ctx0, model.output, h);
-        cb(logits, "result_output", -1);
-        res->t_logits = logits;
-
-        ggml_build_forward_expand(gf, logits);
-        return;
-    }
+    // Only register the output-selection input when we own the last
+    // layer. Middle peers must emit every position's hidden state.
+    ggml_tensor * inp_out_ids = own_last_layer ? build_inp_out_ids() : nullptr;
 
     for (int il = il_start; il < il_end; ++il) {
         ggml_tensor * inpSA = inpL;
@@ -257,8 +268,8 @@ llm_build_deepseek2::llm_build_deepseek2(const llama_model & model, const llm_gr
         }
         // Only apply the final-layer output-selection optimization when
         // the pipeline owns the true last layer. Middle peers must emit
-        // every position's hidden state.
-        if (il == (int32_t) effective_n_layers - 1 && il_end == (int32_t) effective_n_layers && inp_out_ids) {
+        // every position's hidden state (inp_out_ids is nullptr there).
+        if (il == (int32_t) effective_n_layers - 1 && own_last_layer && inp_out_ids) {
             cur   = ggml_get_rows(ctx0, cur, inp_out_ids);
             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
         }
@@ -316,9 +327,19 @@ llm_build_deepseek2::llm_build_deepseek2(const llama_model & model, const llm_gr
     }
     cur = inpL;
 
-    // Partial-range peer: return raw hidden state, skip norm + head.
-    if (il_end < (int32_t) effective_n_layers) {
+    // Partial-range peer: return pre-norm post-layer hidden state; skip
+    // norm + head — those belong to the final peer's head_only call.
+    if (!own_last_layer) {
         cb(cur, "result_embd_partial", -1);
+        res->t_embd = cur;
+        ggml_build_forward_expand(gf, cur);
+        return;
+    }
+
+    // Last peer without head: same semantics as middle peer — expose
+    // pre-norm hidden state, let head_only apply norm + lm_head later.
+    if (!params.run_head) {
+        cb(cur, "result_embd_prehead", -1);
         res->t_embd = cur;
         ggml_build_forward_expand(gf, cur);
         return;
@@ -328,12 +349,6 @@ llm_build_deepseek2::llm_build_deepseek2(const llama_model & model, const llm_gr
 
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
-
-    if (!params.run_head) {
-        // Last peer without head: pass the post-norm hidden state along.
-        ggml_build_forward_expand(gf, cur);
-        return;
-    }
 
     // lm_head
     cur = ggml_mul_mat(ctx0, model.output, cur);

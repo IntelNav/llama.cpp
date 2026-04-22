@@ -1932,7 +1932,8 @@ struct layer_range_guard {
 int llama_context::decode_layers(
         const llama_batch & batch_inp,
         int32_t             start,
-        int32_t             end) {
+        int32_t             end,
+        bool                run_head) {
     const int32_t n_layer = (int32_t) model.hparams.n_layer;
 
     if (start < 0 || end < start || end > n_layer) {
@@ -1940,20 +1941,25 @@ int llama_context::decode_layers(
                 __func__, start, end, n_layer);
         return -1;
     }
-
-    // run_head=true only when we include the very last layer AND the
-    // caller signals we are the tail peer. Middle peers (end < n_layer)
-    // return hidden state; last peer typically uses decode() directly.
-    const bool run_head = false;
+    if (run_head && end != n_layer) {
+        LLAMA_LOG_ERROR("%s: run_head=true requires end == n_layer (got %d)\n",
+                __func__, end);
+        return -1;
+    }
 
     layer_range_guard guard(
             layer_range_start, layer_range_end, layer_run_head,
             start, end, run_head);
 
-    // Force all positions to produce a hidden-state output so the next
-    // peer in the chain receives the full [n_tokens, n_embd] tensor.
+    // When we are NOT running the head, force all positions to produce a
+    // hidden-state output so the next peer in the chain receives the full
+    // [n_tokens, n_embd] tensor. When we ARE running the head, respect
+    // the batch.logits flags — the caller gets to choose which positions
+    // produce logits, same as stock llama_decode().
     const bool saved_emb = cparams.embeddings;
-    cparams.embeddings = true;
+    if (!run_head) {
+        cparams.embeddings = true;
+    }
     const int ret = decode(batch_inp);
     cparams.embeddings = saved_emb;
 
@@ -3583,8 +3589,9 @@ int32_t llama_decode_layers(
         llama_context * ctx,
           llama_batch   batch,
               int32_t   layer_start,
-              int32_t   layer_end) {
-    const int ret = ctx->decode_layers(batch, layer_start, layer_end);
+              int32_t   layer_end,
+                 bool   run_head) {
+    const int ret = ctx->decode_layers(batch, layer_start, layer_end, run_head);
     if (ret != 0 && ret != 1) {
         LLAMA_LOG_ERROR("%s: failed to decode_layers, ret = %d\n", __func__, ret);
     }
