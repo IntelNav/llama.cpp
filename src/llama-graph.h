@@ -564,6 +564,19 @@ struct llm_graph_params {
 
     uint32_t n_outputs;
 
+    // IntelNav layer-range extensions (https://github.com/IntelNav/llama.cpp).
+    // Control which transformer layers run and whether the final
+    // output_norm + lm_head are applied. Defaults preserve stock
+    // llama.cpp behavior: full layer range, head applied.
+    //   layer_start / layer_end define a half-open range [start, end);
+    //   layer_end == -1 is a sentinel meaning "n_layer" (all layers).
+    //   run_head = true applies output_norm and lm_head to the final
+    //     hidden state; false stops after the layer range and exposes
+    //     the hidden state via res->t_embd only.
+    int32_t layer_start = 0;
+    int32_t layer_end   = -1;
+    bool    run_head    = true;
+
     llm_graph_cb cb;
 
     llm_graph_result * res;
@@ -630,7 +643,12 @@ struct llm_graph_params {
             gtype == other.gtype &&
             cvec  == other.cvec  &&
             loras == other.loras &&
-            cross == other.cross;
+            cross == other.cross &&
+            // IntelNav layer-range extensions: different layer ranges
+            // or head toggles build topologically different graphs.
+            layer_start == other.layer_start &&
+            layer_end   == other.layer_end   &&
+            run_head    == other.run_head;
     }
 };
 

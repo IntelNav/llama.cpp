@@ -1882,6 +1882,113 @@ int llama_context::decode(const llama_batch & batch_inp) {
 }
 
 //
+// IntelNav layer-range extensions
+//
+// These three methods all forward to decode() after setting transient
+// state that graph_params() then plumbs into llm_graph_params and each
+// per-arch graph builder honors. The transient state is always reset
+// via an RAII guard so that a subsequent llama_decode() call uses the
+// stock full-forward path.
+//
+
+namespace {
+
+struct layer_range_guard {
+    int32_t & layer_range_start;
+    int32_t & layer_range_end;
+    bool    & layer_run_head;
+
+    int32_t saved_start;
+    int32_t saved_end;
+    bool    saved_run_head;
+
+    layer_range_guard(
+            int32_t & start_ref,
+            int32_t & end_ref,
+            bool    & head_ref,
+            int32_t   start,
+            int32_t   end,
+            bool      head)
+        : layer_range_start(start_ref)
+        , layer_range_end(end_ref)
+        , layer_run_head(head_ref)
+        , saved_start(start_ref)
+        , saved_end(end_ref)
+        , saved_run_head(head_ref) {
+        layer_range_start = start;
+        layer_range_end   = end;
+        layer_run_head    = head;
+    }
+
+    ~layer_range_guard() {
+        layer_range_start = saved_start;
+        layer_range_end   = saved_end;
+        layer_run_head    = saved_run_head;
+    }
+};
+
+} // namespace
+
+int llama_context::decode_layers(
+        const llama_batch & batch_inp,
+        int32_t             start,
+        int32_t             end) {
+    const int32_t n_layer = (int32_t) model.hparams.n_layer;
+
+    if (start < 0 || end < start || end > n_layer) {
+        LLAMA_LOG_ERROR("%s: invalid layer range [%d, %d); model has %d layers\n",
+                __func__, start, end, n_layer);
+        return -1;
+    }
+
+    // run_head=true only when we include the very last layer AND the
+    // caller signals we are the tail peer. Middle peers (end < n_layer)
+    // return hidden state; last peer typically uses decode() directly.
+    const bool run_head = false;
+
+    layer_range_guard guard(
+            layer_range_start, layer_range_end, layer_run_head,
+            start, end, run_head);
+
+    // Force all positions to produce a hidden-state output so the next
+    // peer in the chain receives the full [n_tokens, n_embd] tensor.
+    const bool saved_emb = cparams.embeddings;
+    cparams.embeddings = true;
+    const int ret = decode(batch_inp);
+    cparams.embeddings = saved_emb;
+
+    return ret;
+}
+
+int llama_context::embed_only(const llama_batch & batch_inp) {
+    // layer_start == layer_end == 0 -> skip the entire layer loop.
+    // run_head=false -> skip output_norm and lm_head.
+    // The per-arch builders return res->t_embd = inpL (post-embed-lookup).
+    layer_range_guard guard(
+            layer_range_start, layer_range_end, layer_run_head,
+            /*start=*/0, /*end=*/0, /*run_head=*/false);
+
+    const bool saved_emb = cparams.embeddings;
+    cparams.embeddings = true;
+    const int ret = decode(batch_inp);
+    cparams.embeddings = saved_emb;
+
+    return ret;
+}
+
+int llama_context::head_only(const llama_batch & batch_inp) {
+    // layer_start == layer_end == 0 -> skip layers.
+    // run_head=true -> apply output_norm + lm_head to the provided
+    // hidden state (via batch.embd, which the graph routes through
+    // build_inp_embd's embedding branch).
+    layer_range_guard guard(
+            layer_range_start, layer_range_end, layer_run_head,
+            /*start=*/0, /*end=*/0, /*run_head=*/true);
+
+    return decode(batch_inp);
+}
+
+//
 // output
 //
 
@@ -2150,7 +2257,7 @@ llm_graph_params llama_context::graph_params(
                       const llama_ubatch & ubatch,
             const llama_memory_context_i * mctx,
                           llm_graph_type   gtype) const {
-    return {
+    llm_graph_params params = {
         /*.arch        =*/ model.arch,
         /*.hparams     =*/ model.hparams,
         /*.cparams     =*/ cparams,
@@ -2164,9 +2271,18 @@ llm_graph_params llama_context::graph_params(
         /*.cross       =*/ &cross,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
-        /*.cb          =*/ graph_get_cb(),
-        /*.res         =*/ res,
     };
+
+    // IntelNav layer-range extensions. Plumb the transient fields set
+    // by decode_layers/embed_only/head_only into the graph builder.
+    params.layer_start = layer_range_start;
+    params.layer_end   = layer_range_end;
+    params.run_head    = layer_run_head;
+
+    params.cb  = graph_get_cb();
+    params.res = res;
+
+    return params;
 }
 
 ggml_status llama_context::graph_compute(
@@ -3454,6 +3570,45 @@ int32_t llama_decode(
     const int ret = ctx->decode(batch);
     if (ret != 0 && ret != 1) {
         LLAMA_LOG_ERROR("%s: failed to decode, ret = %d\n", __func__, ret);
+    }
+
+    return ret;
+}
+
+//
+// IntelNav layer-range extensions
+//
+
+int32_t llama_decode_layers(
+        llama_context * ctx,
+          llama_batch   batch,
+              int32_t   layer_start,
+              int32_t   layer_end) {
+    const int ret = ctx->decode_layers(batch, layer_start, layer_end);
+    if (ret != 0 && ret != 1) {
+        LLAMA_LOG_ERROR("%s: failed to decode_layers, ret = %d\n", __func__, ret);
+    }
+
+    return ret;
+}
+
+int32_t llama_embed_only(
+        llama_context * ctx,
+          llama_batch   batch) {
+    const int ret = ctx->embed_only(batch);
+    if (ret != 0 && ret != 1) {
+        LLAMA_LOG_ERROR("%s: failed to embed_only, ret = %d\n", __func__, ret);
+    }
+
+    return ret;
+}
+
+int32_t llama_head_only(
+        llama_context * ctx,
+          llama_batch   batch) {
+    const int ret = ctx->head_only(batch);
+    if (ret != 0 && ret != 1) {
+        LLAMA_LOG_ERROR("%s: failed to head_only, ret = %d\n", __func__, ret);
     }
 
     return ret;

@@ -119,6 +119,23 @@ struct llama_context {
     int encode(const llama_batch & batch_inp);
     int decode(const llama_batch & batch_inp);
 
+    // IntelNav layer-range extensions.
+    // Run only layers [layer_start, layer_end) of the transformer; do
+    // not apply output_norm or lm_head. On success, per-position hidden
+    // state is available via get_embeddings_ith().
+    // batch.embd must be set (not batch.token) when layer_start > 0,
+    // i.e. the caller is supplying an already-embedded tensor.
+    int decode_layers(const llama_batch & batch_inp, int32_t layer_start, int32_t layer_end);
+
+    // Tokens -> embedding lookup only. No layers, no head.
+    // Per-position embedding available via get_embeddings_ith().
+    int embed_only(const llama_batch & batch_inp);
+
+    // Hidden-state -> output_norm -> lm_head. Skips the layer loop.
+    // batch.embd must carry the input hidden state.
+    // Per-position logits available via get_logits_ith().
+    int head_only(const llama_batch & batch_inp);
+
     //
     // state save/load
     //
@@ -346,4 +363,12 @@ private:
     mutable int32_t n_eval   = 0; // number of eval calls
 
     mutable int32_t n_reused = 0; // number of times the previous graph was reused
+
+    // IntelNav layer-range extensions. Set by decode_layers/embed_only/
+    // head_only immediately before calling decode(); consumed by
+    // graph_params() when building the per-call llm_graph_params;
+    // reset back to the stock-llama.cpp defaults on the way out.
+    int32_t layer_range_start = 0;
+    int32_t layer_range_end   = -1;
+    bool    layer_run_head    = true;
 };
