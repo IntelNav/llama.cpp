@@ -940,6 +940,49 @@ extern "C" {
             struct llama_context * ctx,
               struct llama_batch   batch);
 
+    //
+    // IntelNav layer-range extensions (https://github.com/IntelNav/llama.cpp)
+    //
+    // These three functions expose the internal layer loop so a model
+    // can be split across multiple processes/machines (pipeline
+    // parallelism). Semantics:
+    //
+    //   llama_embed_only:
+    //     tokens -> embedding lookup, no layers, no head.
+    //     Per-position hidden state available via
+    //     llama_get_embeddings_ith().
+    //
+    //   llama_decode_layers:
+    //     run layers [layer_start, layer_end) of the transformer stack,
+    //     then stop (no output_norm, no lm_head). For layer_start > 0,
+    //     the caller must supply an already-embedded tensor via
+    //     batch.embd (use llama_batch_init(n_tokens, n_embd, n_seq_max)
+    //     to allocate). For layer_start == 0, batch.token is used and
+    //     the embedding lookup runs as usual. Per-position hidden state
+    //     available via llama_get_embeddings_ith().
+    //
+    //   llama_head_only:
+    //     supplied hidden state -> output_norm -> lm_head. batch.embd
+    //     must carry the input hidden state. Per-position logits
+    //     available via llama_get_logits_ith().
+    //
+    // Supported architectures: LLAMA, QWEN2, DEEPSEEK2. Other archs
+    // will return -1. Return codes mirror llama_decode().
+    //
+    LLAMA_API int32_t llama_embed_only(
+            struct llama_context * ctx,
+              struct llama_batch   batch);
+
+    LLAMA_API int32_t llama_decode_layers(
+            struct llama_context * ctx,
+              struct llama_batch   batch,
+                     int32_t       layer_start,
+                     int32_t       layer_end);
+
+    LLAMA_API int32_t llama_head_only(
+            struct llama_context * ctx,
+              struct llama_batch   batch);
+
     // Set the number of threads used for decoding
     // n_threads is the number of threads used for generation (single token)
     // n_threads_batch is the number of threads used for prompt and batch processing (multiple tokens)

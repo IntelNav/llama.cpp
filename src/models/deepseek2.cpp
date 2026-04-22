@@ -49,7 +49,39 @@ llm_build_deepseek2::llm_build_deepseek2(const llama_model & model, const llm_gr
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
     int effective_n_layers = hparams.n_layer - hparams.nextn_predict_layers;
-    for (int il = 0; il < effective_n_layers; ++il) {
+
+    // IntelNav layer-range extensions. See llama-graph.h for field docs.
+    const int32_t il_start = params.layer_start;
+    const int32_t il_end   = params.layer_end >= 0
+                                 ? params.layer_end
+                                 : (int32_t) effective_n_layers;
+
+    // Embed-only path: skip the layer loop and return raw embeddings.
+    if (il_end == il_start && !params.run_head) {
+        cb(inpL, "result_embd_only", -1);
+        res->t_embd = inpL;
+        ggml_build_forward_expand(gf, inpL);
+        return;
+    }
+
+    // Head-only path: skip the layer loop, apply output_norm + lm_head
+    // to the caller-supplied hidden state that entered via build_inp_embd.
+    if (il_end == il_start && params.run_head) {
+        ggml_tensor * h = build_norm(inpL,
+                model.output_norm, NULL,
+                LLM_NORM_RMS, -1);
+        cb(h, "result_norm", -1);
+        res->t_embd = h;
+
+        ggml_tensor * logits = ggml_mul_mat(ctx0, model.output, h);
+        cb(logits, "result_output", -1);
+        res->t_logits = logits;
+
+        ggml_build_forward_expand(gf, logits);
+        return;
+    }
+
+    for (int il = il_start; il < il_end; ++il) {
         ggml_tensor * inpSA = inpL;
 
         // norm
@@ -223,7 +255,10 @@ llm_build_deepseek2::llm_build_deepseek2(const llama_model & model, const llm_gr
                             Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
             }
         }
-        if (il == effective_n_layers - 1 && inp_out_ids) {
+        // Only apply the final-layer output-selection optimization when
+        // the pipeline owns the true last layer. Middle peers must emit
+        // every position's hidden state.
+        if (il == (int32_t) effective_n_layers - 1 && il_end == (int32_t) effective_n_layers && inp_out_ids) {
             cur   = ggml_get_rows(ctx0, cur, inp_out_ids);
             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
         }
@@ -281,10 +316,24 @@ llm_build_deepseek2::llm_build_deepseek2(const llama_model & model, const llm_gr
     }
     cur = inpL;
 
+    // Partial-range peer: return raw hidden state, skip norm + head.
+    if (il_end < (int32_t) effective_n_layers) {
+        cb(cur, "result_embd_partial", -1);
+        res->t_embd = cur;
+        ggml_build_forward_expand(gf, cur);
+        return;
+    }
+
     cur = build_norm(cur, model.output_norm, NULL, LLM_NORM_RMS, -1);
 
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
+
+    if (!params.run_head) {
+        // Last peer without head: pass the post-norm hidden state along.
+        ggml_build_forward_expand(gf, cur);
+        return;
+    }
 
     // lm_head
     cur = ggml_mul_mat(ctx0, model.output, cur);
