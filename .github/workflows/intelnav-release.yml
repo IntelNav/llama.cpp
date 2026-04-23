@@ -106,12 +106,25 @@ jobs:
       - uses: actions/checkout@v6
         with: { fetch-depth: 0 }
 
-      - name: Install Vulkan toolchain
+      - name: Install Vulkan SDK prereqs
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            vulkan-headers libvulkan-dev glslc spirv-tools shaderc \
-            libglslang-dev
+            build-essential curl tar xz-utils libxcb-xinput0 libxcb-xinerama0 libxcb-cursor-dev libssl-dev
+
+      # Pull the LunarG SDK rather than scraping apt packages that move
+      # around between Ubuntu LTSes. Matches upstream `build-vulkan.yml`.
+      - name: Install LunarG Vulkan SDK
+        run: |
+          set -e
+          ver="$(curl -fsSL https://vulkan.lunarg.com/sdk/latest/linux.txt)"
+          echo "Vulkan SDK version: $ver"
+          curl -fsSL "https://sdk.lunarg.com/sdk/download/${ver}/linux/vulkan_sdk.tar.xz" -o /tmp/vulkan.tar.xz
+          mkdir -p "$HOME/vulkan_sdk"
+          tar -xJf /tmp/vulkan.tar.xz -C "$HOME/vulkan_sdk" --strip-components=1
+          echo "VULKAN_SDK=$HOME/vulkan_sdk/x86_64" >> "$GITHUB_ENV"
+          echo "$HOME/vulkan_sdk/x86_64/bin" >> "$GITHUB_PATH"
+          echo "LD_LIBRARY_PATH=$HOME/vulkan_sdk/x86_64/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
 
       - uses: ggml-org/ccache-action@v1.2.21
         with:
@@ -151,11 +164,24 @@ jobs:
 
       - name: Install ROCm
         run: |
+          # The GH jammy runner ships pre-existing rocm-* bits from the
+          # Ubuntu archive (e.g. rocm-cmake 5.0) which conflict with
+          # Radeon's own 6.x packages. Purge first, then pin Radeon's
+          # repo with apt preferences so the full 6.x stack resolves
+          # as a single coherent set.
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends wget gnupg
-          wget -O - https://repo.radeon.com/rocm/rocm.gpg.key | sudo apt-key add -
-          echo 'deb [arch=amd64] https://repo.radeon.com/rocm/apt/6.0 jammy main' | \
-            sudo tee /etc/apt/sources.list.d/rocm.list
+          sudo apt-get purge -y 'rocm-*' 'hip-*' 'miopen-*' 'hsa-*' 'hipblas*' 'rocblas*' 'rocfft*' || true
+          sudo apt-get autoremove -y || true
+
+          sudo mkdir -p /etc/apt/keyrings
+          wget -qO - https://repo.radeon.com/rocm/rocm.gpg.key \
+            | sudo gpg --dearmor -o /etc/apt/keyrings/rocm.gpg
+          echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] https://repo.radeon.com/rocm/apt/6.2.4 jammy main" \
+            | sudo tee /etc/apt/sources.list.d/rocm.list
+          printf 'Package: *\nPin: origin "repo.radeon.com"\nPin-Priority: 600\n' \
+            | sudo tee /etc/apt/preferences.d/rocm-pin-600 >/dev/null
+
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             rocm-dev rocm-libs hipblas-dev rocblas-dev
@@ -209,12 +235,25 @@ jobs:
       - uses: actions/checkout@v6
         with: { fetch-depth: 0 }
 
-      - uses: Jimver/cuda-toolkit@v0.2.21
-        id: cuda-toolkit
-        with:
-          cuda: '12.6.0'
-          method: 'network'
-          sub-packages: '["nvcc", "cudart-dev", "cublas-dev", "cublas"]'
+      # Install CUDA 12.6 from NVIDIA's own apt repo directly — the
+      # Jimver action's sub-package name for cublas drifted between
+      # CUDA 11 (cuda-cublas-*) and CUDA 12 (libcublas-*), and pinning
+      # the real package names keeps us independent of that.
+      - name: Install CUDA 12.6
+        run: |
+          set -e
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ca-certificates gnupg curl
+          sudo mkdir -p /etc/apt/keyrings
+          curl -fsSL https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/3bf863cc.pub \
+            | sudo gpg --dearmor -o /etc/apt/keyrings/nvidia-cuda.gpg
+          echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/nvidia-cuda.gpg] https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/ /" \
+            | sudo tee /etc/apt/sources.list.d/nvidia-cuda.list
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cuda-nvcc-12-6 cuda-cudart-dev-12-6 libcublas-dev-12-6 libcublas-12-6
+          echo "/usr/local/cuda-12.6/bin" >> $GITHUB_PATH
+          echo "CUDA_PATH=/usr/local/cuda-12.6" >> $GITHUB_ENV
 
       - uses: ggml-org/ccache-action@v1.2.21
         with:
