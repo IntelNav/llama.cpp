@@ -265,11 +265,17 @@ jobs:
 
       - name: Configure
         run: |
+          # Narrow arch list keeps the CUDA build under the hosted
+          # runner's 6-hour ceiling and within practical ccache reuse.
+          # 86 covers RTX 30-series / A100-like; 89 covers RTX 40.
+          # Users with older (Turing sm_75) or newer (Hopper sm_90)
+          # hardware rebuild from source locally — add them back when
+          # there's real CI demand.
           cmake -B build \
             ${{ env.CMAKE_COMMON }} \
             -DGGML_NATIVE=OFF \
             -DGGML_CUDA=ON \
-            -DCMAKE_CUDA_ARCHITECTURES="75;80;86;89;90" \
+            -DCMAKE_CUDA_ARCHITECTURES="86;89" \
             -DGGML_BACKEND_DL=ON
 
       - name: Build
