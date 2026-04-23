@@ -1,0 +1,227 @@
+# IntelNav release — builds the IntelNav-patched libllama for each
+# (backend x OS x arch) the Rust FFI crate (`intelnav-ggml`) expects to
+# find under ~/.cache/intelnav/libllama/. Triggered on tag push matching
+# `intelnav-v*` (so upstream ggml-org's own releases don't fire this),
+# and manually via workflow_dispatch for dev iteration.
+#
+# Each job produces:
+#   libllama-<backend>-<os>-<arch>.tar.gz
+#     containing:
+#       bin/libllama.so*            (or .dylib / .dll on other OSes)
+#       bin/libggml.so*
+#       bin/libggml-base.so*
+#       bin/libggml-cpu*.so         (one or more, per CPU-variant build)
+#       bin/libggml-<backend>.so    (ROCm / CUDA / Vulkan / SYCL)
+#       include/llama.h
+#       include/ggml.h
+#       include/ggml-*.h
+#       LICENSE
+#       INTELNAV_SHA                (git rev of the fork — the FFI crate
+#                                    reads this to key its cache path)
+#
+# On tag push, all artifacts are uploaded to the matching GitHub Release.
+# On workflow_dispatch, they stay as job artifacts for inspection.
+#
+# Scope for the first cut: Linux x86_64 only, with CPU + Vulkan + ROCm.
+# Each is a free runner and none require proprietary SDKs beyond what
+# `apt` and the ROCm/Vulkan repos provide. CUDA, Metal, SYCL, Windows,
+# and macOS arm64 are follow-ups — deliberately left out so this
+# workflow actually ships and starts producing artifacts this week.
+
+name: IntelNav release
+
+on:
+  workflow_dispatch:
+    inputs:
+      make_release:
+        description: "Upload artifacts to a GitHub Release (requires a tag)."
+        type: boolean
+        default: false
+  push:
+    tags:
+      - 'intelnav-v*'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref && github.ref || github.run_id }}
+  cancel-in-progress: true
+
+env:
+  # Common cmake args across all backends. Keep tools/server/examples
+  # OFF — consumers of intelnav-ggml link libllama + libggml* as a
+  # library and don't need the CLI tools.
+  CMAKE_COMMON: >-
+    -DLLAMA_BUILD_EXAMPLES=OFF
+    -DLLAMA_BUILD_TESTS=OFF
+    -DLLAMA_BUILD_TOOLS=OFF
+    -DLLAMA_BUILD_SERVER=OFF
+    -DCMAKE_BUILD_TYPE=Release
+    -DBUILD_SHARED_LIBS=ON
+  # ccache key suffix used by every job. Bump to bust.
+  CCACHE_GEN: v1
+
+jobs:
+  # ---------------------------------------------------------------------
+  # linux-x64 CPU — universal fallback. Ships with GGML_CPU_ALL_VARIANTS
+  # so runtime dispatch picks SSE / AVX2 / AVX-512 as available.
+  # ---------------------------------------------------------------------
+  linux-x64-cpu:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v6
+        with: { fetch-depth: 0 }
+
+      - uses: ggml-org/ccache-action@v1.2.21
+        with:
+          key: intelnav-linux-x64-cpu-${{ env.CCACHE_GEN }}
+          evict-old-files: 1d
+
+      - name: Configure
+        run: |
+          cmake -B build \
+            ${{ env.CMAKE_COMMON }} \
+            -DGGML_NATIVE=OFF \
+            -DGGML_CPU_ALL_VARIANTS=ON \
+            -DGGML_BACKEND_DL=ON
+
+      - name: Build
+        run: cmake --build build -j $(nproc) --target llama
+
+      - name: Package
+        run: .github/actions/intelnav-pack.sh linux-x64-cpu
+        shell: bash
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: libllama-linux-x64-cpu
+          path: dist/*.tar.gz
+
+  # ---------------------------------------------------------------------
+  # linux-x64 Vulkan — the "any GPU on Linux" backend. Covers AMD
+  # (without ROCm), Intel Arc, NVIDIA (without CUDA), and integrated
+  # graphics on every modern distro.
+  # ---------------------------------------------------------------------
+  linux-x64-vulkan:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v6
+        with: { fetch-depth: 0 }
+
+      - name: Install Vulkan toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            vulkan-headers libvulkan-dev glslc spirv-tools shaderc \
+            libglslang-dev
+
+      - uses: ggml-org/ccache-action@v1.2.21
+        with:
+          key: intelnav-linux-x64-vulkan-${{ env.CCACHE_GEN }}
+          evict-old-files: 1d
+
+      - name: Configure
+        run: |
+          cmake -B build \
+            ${{ env.CMAKE_COMMON }} \
+            -DGGML_NATIVE=OFF \
+            -DGGML_VULKAN=ON \
+            -DGGML_BACKEND_DL=ON
+
+      - name: Build
+        run: cmake --build build -j $(nproc) --target llama
+
+      - name: Package
+        run: .github/actions/intelnav-pack.sh linux-x64-vulkan
+        shell: bash
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: libllama-linux-x64-vulkan
+          path: dist/*.tar.gz
+
+  # ---------------------------------------------------------------------
+  # linux-x64 ROCm — AMD Radeon (gfx9+) acceleration, the headline
+  # IntelNav win. The user's RX 6600 (gfx1032) is covered by setting
+  # AMDGPU_TARGETS to include gfx1030 (handles gfx1031/1032 via override).
+  # ---------------------------------------------------------------------
+  linux-x64-rocm:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v6
+        with: { fetch-depth: 0 }
+
+      - name: Install ROCm
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends wget gnupg
+          wget -O - https://repo.radeon.com/rocm/rocm.gpg.key | sudo apt-key add -
+          echo 'deb [arch=amd64] https://repo.radeon.com/rocm/apt/6.0 jammy main' | \
+            sudo tee /etc/apt/sources.list.d/rocm.list
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            rocm-dev rocm-libs hipblas-dev rocblas-dev
+          echo "/opt/rocm/bin" >> $GITHUB_PATH
+
+      - uses: ggml-org/ccache-action@v1.2.21
+        with:
+          key: intelnav-linux-x64-rocm-${{ env.CCACHE_GEN }}
+          evict-old-files: 1d
+
+      - name: Configure
+        env:
+          # gfx1030 bytecode is binary-compatible with gfx1031/1032 via
+          # HSA_OVERRIDE_GFX_VERSION=10.3.0 at run time — one artifact
+          # covers the RX 6600 / 6700 / 6800 family. Add more archs
+          # here as we get hardware to test on.
+          AMDGPU_TARGETS: "gfx900;gfx906;gfx908;gfx90a;gfx1030;gfx1100"
+        run: |
+          cmake -B build \
+            ${{ env.CMAKE_COMMON }} \
+            -DGGML_NATIVE=OFF \
+            -DGGML_HIP=ON \
+            -DCMAKE_C_COMPILER=/opt/rocm/llvm/bin/clang \
+            -DCMAKE_CXX_COMPILER=/opt/rocm/llvm/bin/clang++ \
+            -DAMDGPU_TARGETS=$AMDGPU_TARGETS \
+            -DGGML_BACKEND_DL=ON
+
+      - name: Build
+        run: cmake --build build -j $(nproc) --target llama
+
+      - name: Package
+        run: .github/actions/intelnav-pack.sh linux-x64-rocm
+        shell: bash
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: libllama-linux-x64-rocm
+          path: dist/*.tar.gz
+
+  # ---------------------------------------------------------------------
+  # Upload to Release. Only runs on tag push or when
+  # workflow_dispatch.inputs.make_release is true.
+  # ---------------------------------------------------------------------
+  publish-release:
+    needs: [linux-x64-cpu, linux-x64-vulkan, linux-x64-rocm]
+    if: startsWith(github.ref, 'refs/tags/intelnav-v') || inputs.make_release
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v6
+        with:
+          path: artifacts
+
+      - name: Collect artifacts
+        run: |
+          mkdir -p dist
+          find artifacts -name '*.tar.gz' -exec cp {} dist/ \;
+          ls -la dist/
+
+      - name: Publish
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.tar.gz
+          fail_on_unmatched_files: true
+          generate_release_notes: true
