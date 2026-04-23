@@ -1,3 +1,6 @@
+# IntelNav packaging output (see .github/actions/intelnav-pack.sh)
+dist/
+
 # Extensions
 
 *.a
