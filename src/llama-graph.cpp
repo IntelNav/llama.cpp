@@ -1723,31 +1723,46 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
     std::array<ggml_tensor *, 2> inps;
 
     // token embeddings path (ubatch.token != nullptr)
+    //
+    // IntelNav: a partial-model peer with `intelnav.has_embed=false`
+    // never owns `tok_embd`. Normally the dual-path builder
+    // constructs this branch unconditionally and lets the graph
+    // select between tokens/embd at exec time, but building it
+    // requires dereferencing `tok_embd` here. When it's absent, we
+    // reuse the vector branch — the partial peer only ever feeds
+    // `ubatch.embd` anyway, so the token branch is dead code.
     {
         auto & cur = inps[0];
 
-        cur = ggml_get_rows(ctx0, tok_embd, inp->tokens);
+        if (tok_embd == nullptr) {
+            cur = inp->embd;
+            if (n_embd_inp != n_embd) {
+                cur = ggml_pad(ctx0, cur, hparams.n_embd_inp() - n_embd, 0, 0, 0);
+            }
+        } else {
+            cur = ggml_get_rows(ctx0, tok_embd, inp->tokens);
 
-        // apply lora for embedding tokens if needed
-        for (const auto & lora : *loras) {
-            llama_adapter_lora_weight * lw = lora.first->get_weight(tok_embd);
-            if (lw == nullptr) {
-                continue;
+            // apply lora for embedding tokens if needed
+            for (const auto & lora : *loras) {
+                llama_adapter_lora_weight * lw = lora.first->get_weight(tok_embd);
+                if (lw == nullptr) {
+                    continue;
+                }
+
+                const float adapter_scale = lora.second;
+                const float scale = lw->get_scale(lora.first->alpha, adapter_scale);
+
+                ggml_tensor * inpL_delta = ggml_scale(ctx0, ggml_mul_mat(
+                            ctx0, lw->b, // non-transposed lora_b
+                            ggml_get_rows(ctx0, lw->a, inp->tokens)
+                            ), scale);
+
+                cur = ggml_add(ctx0, cur, inpL_delta);
             }
 
-            const float adapter_scale = lora.second;
-            const float scale = lw->get_scale(lora.first->alpha, adapter_scale);
-
-            ggml_tensor * inpL_delta = ggml_scale(ctx0, ggml_mul_mat(
-                        ctx0, lw->b, // non-transposed lora_b
-                        ggml_get_rows(ctx0, lw->a, inp->tokens)
-                        ), scale);
-
-            cur = ggml_add(ctx0, cur, inpL_delta);
-        }
-
-        if (n_embd_inp != n_embd) {
-            cur = ggml_pad(ctx0, cur, hparams.n_embd_inp() - n_embd, 0, 0, 0);
+            if (n_embd_inp != n_embd) {
+                cur = ggml_pad(ctx0, cur, hparams.n_embd_inp() - n_embd, 0, 0, 0);
+            }
         }
     }
 
