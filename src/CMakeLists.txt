@@ -38,6 +38,11 @@ add_library(llama
             unicode-data.cpp
             unicode.cpp
             unicode.h
+            # IntelNav C-side shim: exports intelnav_load_model /
+            # intelnav_new_context / intelnav_trip_abort so the Rust
+            # FFI can dlopen a single libllama.so and skip maintaining
+            # a brittle mirror of llama.cpp's by-value param structs.
+            intelnav-shim.cpp
             ${LLAMA_MODELS_SOURCES}
             )
 
