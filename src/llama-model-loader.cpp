@@ -701,6 +701,27 @@ llama_model_loader::llama_model_loader(
 
     fver = (enum llama_fver) gguf_get_version(metadata);
 
+    // IntelNav partial-model flags. Both default to true (backward
+    // compat: standard GGUFs load exactly as before). A stitched
+    // subset GGUF sets them to false to signal that the corresponding
+    // tensors are deliberately absent.
+    {
+        bool has_embed = true;
+        bool has_head  = true;
+        get_key(std::string("intelnav.has_embed"), has_embed, /*required=*/false);
+        get_key(std::string("intelnav.has_head"),  has_head,  /*required=*/false);
+        if (!has_embed) {
+            intelnav_optional_name_prefixes.emplace_back("token_embd");
+        }
+        if (!has_head) {
+            intelnav_optional_name_prefixes.emplace_back("output");
+        }
+        if (!has_embed || !has_head) {
+            LLAMA_LOG_INFO("%s: intelnav partial model (has_embed=%d, has_head=%d)\n",
+                    __func__, (int)has_embed, (int)has_head);
+        }
+    }
+
     LLAMA_LOG_INFO("%s: loaded meta data with %d key-value pairs and %d tensors from %s (version %s)\n",
             __func__, n_kv, n_tensors, fname.empty() ? "(file*)" : fname.c_str(), llama_file_version_name(fver));
 
@@ -1045,6 +1066,19 @@ static ggml_backend_buffer_type_t select_weight_buft(const llama_hparams & hpara
 struct ggml_tensor * llama_model_loader::create_tensor(
         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
+    // IntelNav: if this tensor's name matches a prefix the stitched
+    // GGUF declared absent (via intelnav.has_embed / intelnav.has_head),
+    // mark it not-required so buft_for_tensor returns nullptr and
+    // create_tensor returns nullptr instead of throwing.
+    if (!intelnav_optional_name_prefixes.empty()) {
+        const std::string tn_str = tn.str();
+        for (const auto & prefix : intelnav_optional_name_prefixes) {
+            if (tn_str.compare(0, prefix.size(), prefix) == 0) {
+                flags |= TENSOR_NOT_REQUIRED;
+                break;
+            }
+        }
+    }
     auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
         auto it = ctx_map.find(buft);
         if (it == ctx_map.end()) {

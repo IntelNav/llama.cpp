@@ -196,11 +196,96 @@ jobs:
           path: dist/*.tar.gz
 
   # ---------------------------------------------------------------------
+  # linux-x64 CUDA — NVIDIA acceleration. Uses Jimver's cuda-toolkit
+  # action to install a pinned CUDA version on the hosted runner
+  # (~3 GB download cached per runner). Test runs against this
+  # artifact require an NVIDIA GPU, so the intelnav repo exercises it
+  # only on self-hosted `[gpu, nvidia]` runners — but we publish the
+  # build unconditionally so those runners have something to pull.
+  # ---------------------------------------------------------------------
+  linux-x64-cuda:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v6
+        with: { fetch-depth: 0 }
+
+      - uses: Jimver/cuda-toolkit@v0.2.21
+        id: cuda-toolkit
+        with:
+          cuda: '12.6.0'
+          method: 'network'
+          sub-packages: '["nvcc", "cudart-dev", "cublas-dev", "cublas"]'
+
+      - uses: ggml-org/ccache-action@v1.2.21
+        with:
+          key: intelnav-linux-x64-cuda-${{ env.CCACHE_GEN }}
+          evict-old-files: 1d
+
+      - name: Configure
+        run: |
+          cmake -B build \
+            ${{ env.CMAKE_COMMON }} \
+            -DGGML_NATIVE=OFF \
+            -DGGML_CUDA=ON \
+            -DCMAKE_CUDA_ARCHITECTURES="75;80;86;89;90" \
+            -DGGML_BACKEND_DL=ON
+
+      - name: Build
+        run: cmake --build build -j $(nproc) --target llama
+
+      - name: Package
+        run: .github/actions/intelnav-pack.sh linux-x64-cuda
+        shell: bash
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: libllama-linux-x64-cuda
+          path: dist/*.tar.gz
+
+  # ---------------------------------------------------------------------
+  # macOS arm64 Metal — Apple Silicon via Metal Performance Shaders.
+  # macos-14 is the first free runner with an M1; anything older is
+  # Intel and we'd build a different arch. Metal is on by default in
+  # mainline llama.cpp; we just need to keep it explicit.
+  # ---------------------------------------------------------------------
+  macos-arm64-metal:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v6
+        with: { fetch-depth: 0 }
+
+      - uses: ggml-org/ccache-action@v1.2.21
+        with:
+          key: intelnav-macos-arm64-metal-${{ env.CCACHE_GEN }}
+          evict-old-files: 1d
+
+      - name: Configure
+        run: |
+          cmake -B build \
+            ${{ env.CMAKE_COMMON }} \
+            -DGGML_NATIVE=OFF \
+            -DGGML_METAL=ON \
+            -DGGML_METAL_EMBED_LIBRARY=ON \
+            -DGGML_BACKEND_DL=ON
+
+      - name: Build
+        run: cmake --build build -j $(sysctl -n hw.ncpu) --target llama
+
+      - name: Package
+        run: .github/actions/intelnav-pack.sh macos-arm64-metal
+        shell: bash
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: libllama-macos-arm64-metal
+          path: dist/*.tar.gz
+
+  # ---------------------------------------------------------------------
   # Upload to Release. Only runs on tag push or when
   # workflow_dispatch.inputs.make_release is true.
   # ---------------------------------------------------------------------
   publish-release:
-    needs: [linux-x64-cpu, linux-x64-vulkan, linux-x64-rocm]
+    needs: [linux-x64-cpu, linux-x64-vulkan, linux-x64-rocm, linux-x64-cuda, macos-arm64-metal]
     if: startsWith(github.ref, 'refs/tags/intelnav-v') || inputs.make_release
     runs-on: ubuntu-22.04
     # `attestations: write` is required for GitHub's built-in

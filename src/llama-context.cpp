@@ -2285,6 +2285,23 @@ llm_graph_params llama_context::graph_params(
     params.layer_end   = layer_range_end;
     params.run_head    = layer_run_head;
 
+    // IntelNav partial-model override. A stitched mid-slice peer
+    // loaded a GGUF with `intelnav.has_head=false`, which means the
+    // loader left `output` and `output_norm` as null. The worst-case
+    // graph built during sched_reserve normally sets run_head=true,
+    // and every arch's head path dereferences those null pointers.
+    //
+    // Force run_head=false whenever either head tensor is absent:
+    // the arch's existing `if (!params.run_head) { return pre-norm; }`
+    // branch already does the right thing, so this one line covers
+    // qwen, llama/mistral/tinyllama, deepseek, and every other arch
+    // with no per-file patches. A real full model cannot hit this —
+    // model.output is always populated (either directly or duplicated
+    // from tok_embd) on every supported architecture.
+    if (model.output == nullptr || model.output_norm == nullptr) {
+        params.run_head = false;
+    }
+
     params.cb  = graph_get_cb();
     params.res = res;
 

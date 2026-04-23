@@ -99,6 +99,17 @@ struct llama_model_loader {
     std::string arch_name;
     LLM_KV      llm_kv    = LLM_KV(LLM_ARCH_UNKNOWN);
 
+    // IntelNav partial-model support.
+    //
+    // When a peer holds only a slice of a model (e.g. middle layers),
+    // the stitched GGUF sets `intelnav.has_embed=false` and/or
+    // `intelnav.has_head=false` and omits the corresponding tensors
+    // from the tensor index. This vector collects name prefixes that
+    // create_tensor should treat as TENSOR_NOT_REQUIRED, so that an
+    // absent `token_embd.*` or `output*` tensor is returned as
+    // nullptr instead of throwing "missing tensor '...'".
+    std::vector<std::string> intelnav_optional_name_prefixes;
+
     size_t size_done = 0;
     size_t size_data = 0;
     std::vector<std::pair<size_t, size_t>> mmaps_used;
