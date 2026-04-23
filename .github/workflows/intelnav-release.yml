@@ -177,7 +177,10 @@ jobs:
           sudo mkdir -p /etc/apt/keyrings
           wget -qO - https://repo.radeon.com/rocm/rocm.gpg.key \
             | sudo gpg --dearmor -o /etc/apt/keyrings/rocm.gpg
-          echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] https://repo.radeon.com/rocm/apt/6.2.4 jammy main" \
+          # ROCm 6.3+ is required by ggml-cuda's vendor header — it
+          # references `__hip_fp8_e4m3` which older HIP runtimes don't
+          # define. Pin to a current point release on the 6.4 line.
+          echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] https://repo.radeon.com/rocm/apt/6.4 jammy main" \
             | sudo tee /etc/apt/sources.list.d/rocm.list
           printf 'Package: *\nPin: origin "repo.radeon.com"\nPin-Priority: 600\n' \
             | sudo tee /etc/apt/preferences.d/rocm-pin-600 >/dev/null
