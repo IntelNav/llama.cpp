@@ -185,10 +185,18 @@ jobs:
           printf 'Package: *\nPin: origin "repo.radeon.com"\nPin-Priority: 600\n' \
             | sudo tee /etc/apt/preferences.d/rocm-pin-600 >/dev/null
 
+          # Install a minimal HIP + BLAS set rather than the `rocm-dev`
+          # / `rocm-libs` metas — those pull in `rccl`, which 6.4
+          # hard-depends on AMD kernel driver libs (libdrm-amdgpu-*)
+          # that don't exist on GH-hosted runners. Our build only
+          # needs hipcc + HIP headers + hipBLAS + rocBLAS.
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            rocm-dev rocm-libs hipblas-dev rocblas-dev
+            hipcc hip-dev rocm-cmake rocm-device-libs \
+            hipblas-dev rocblas-dev comgr hsa-rocr-dev \
+            rocminfo rocm-llvm
           echo "/opt/rocm/bin" >> $GITHUB_PATH
+          echo "/opt/rocm/llvm/bin" >> $GITHUB_PATH
 
       - uses: ggml-org/ccache-action@v1.2.21
         with:
