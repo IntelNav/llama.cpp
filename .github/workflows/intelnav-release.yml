@@ -22,15 +22,18 @@
 # On tag push, all artifacts are uploaded to the matching GitHub Release.
 # On workflow_dispatch, they stay as job artifacts for inspection.
 #
-# Scope today: Linux x86_64 (CPU + Vulkan + ROCm + CUDA) and macOS
-# arm64 (Metal). All five jobs run on free GitHub-hosted runners — no
-# proprietary SDKs beyond what `apt` (Ubuntu), the Radeon / NVIDIA apt
-# repos, and Apple's bundled toolchain provide.
+# Scope today: Linux x86_64 (CPU + Vulkan + ROCm + CUDA), macOS
+# arm64 (Metal), and Windows x86_64 (Vulkan). All six jobs run on
+# free GitHub-hosted runners — no proprietary SDKs beyond what `apt`
+# (Ubuntu), the Radeon / NVIDIA apt repos, LunarG's Vulkan SDK
+# installer, and Apple's bundled toolchain provide.
 #
 # Still-deferred follow-ups: Linux SYCL (needs the Intel oneAPI base
-# toolkit, multi-GB install) and Windows CPU/CUDA/Vulkan (needs MSVC
-# layout work — Ninja Multi-Config writes to build/bin/Release/, the
-# pack script today only globs build/bin/).
+# toolkit, multi-GB install) and Windows CPU/CUDA (CUDA needs the
+# Windows CUDA Toolkit installer; CPU is a copy-paste of windows-x64-
+# vulkan once we want it). The pack script handles both single-config
+# (Linux/macOS) and multi-config (Visual Studio: build/bin/Release/)
+# build layouts.
 
 name: IntelNav release
 
@@ -341,11 +344,59 @@ jobs:
           path: dist/*.tar.gz
 
   # ---------------------------------------------------------------------
+  # windows-x64 Vulkan — broad GPU coverage for Windows users without
+  # pulling proprietary SDKs. Vulkan covers AMD, Intel, NVIDIA, iGPUs;
+  # NVIDIA-only users will pick a CUDA artifact when that lands.
+  #
+  # Visual Studio is a multi-config generator: artifacts land at
+  # build/bin/Release/, which intelnav-pack.sh picks up. Recipe mirrors
+  # ggml-org/llama.cpp's release.yml `windows-latest-cmake` matrix
+  # entry for `vulkan/x64` — same VulkanSDK installer, same cmake args.
+  # ---------------------------------------------------------------------
+  windows-x64-vulkan:
+    runs-on: windows-2022
+    env:
+      # Pinned to match upstream's release.yml — bump together when
+      # LunarG ships a new SDK we want.
+      VULKAN_VERSION: 1.4.313.2
+    steps:
+      - uses: actions/checkout@v6
+        with: { fetch-depth: 0 }
+
+      - uses: ggml-org/ccache-action@v1.2.21
+        with:
+          key: intelnav-windows-x64-vulkan-${{ env.CCACHE_GEN }}
+          variant: ccache
+          evict-old-files: 1d
+
+      - name: Install Vulkan SDK
+        run: |
+          curl.exe -o $env:RUNNER_TEMP/VulkanSDK-Installer.exe -L "https://sdk.lunarg.com/sdk/download/${env:VULKAN_VERSION}/windows/vulkansdk-windows-X64-${env:VULKAN_VERSION}.exe"
+          & "$env:RUNNER_TEMP\VulkanSDK-Installer.exe" --accept-licenses --default-answer --confirm-command install
+          Add-Content $env:GITHUB_ENV "VULKAN_SDK=C:\VulkanSDK\${env:VULKAN_VERSION}"
+          Add-Content $env:GITHUB_PATH "C:\VulkanSDK\${env:VULKAN_VERSION}\bin"
+
+      - name: Configure
+        run: cmake -B build ${{ env.CMAKE_COMMON }} -DGGML_NATIVE=OFF -DGGML_VULKAN=ON -DGGML_BACKEND_DL=ON
+
+      - name: Build
+        run: cmake --build build --config Release -j --target llama
+
+      - name: Package
+        run: .github/actions/intelnav-pack.sh windows-x64-vulkan
+        shell: bash
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: libllama-windows-x64-vulkan
+          path: dist/*.tar.gz
+
+  # ---------------------------------------------------------------------
   # Upload to Release. Only runs on tag push or when
   # workflow_dispatch.inputs.make_release is true.
   # ---------------------------------------------------------------------
   publish-release:
-    needs: [linux-x64-cpu, linux-x64-vulkan, linux-x64-rocm, linux-x64-cuda, macos-arm64-metal]
+    needs: [linux-x64-cpu, linux-x64-vulkan, linux-x64-rocm, linux-x64-cuda, macos-arm64-metal, windows-x64-vulkan]
     if: startsWith(github.ref, 'refs/tags/intelnav-v') || inputs.make_release
     runs-on: ubuntu-22.04
     # `attestations: write` is required for GitHub's built-in
