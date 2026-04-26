@@ -22,11 +22,15 @@
 # On tag push, all artifacts are uploaded to the matching GitHub Release.
 # On workflow_dispatch, they stay as job artifacts for inspection.
 #
-# Scope for the first cut: Linux x86_64 only, with CPU + Vulkan + ROCm.
-# Each is a free runner and none require proprietary SDKs beyond what
-# `apt` and the ROCm/Vulkan repos provide. CUDA, Metal, SYCL, Windows,
-# and macOS arm64 are follow-ups — deliberately left out so this
-# workflow actually ships and starts producing artifacts this week.
+# Scope today: Linux x86_64 (CPU + Vulkan + ROCm + CUDA) and macOS
+# arm64 (Metal). All five jobs run on free GitHub-hosted runners — no
+# proprietary SDKs beyond what `apt` (Ubuntu), the Radeon / NVIDIA apt
+# repos, and Apple's bundled toolchain provide.
+#
+# Still-deferred follow-ups: Linux SYCL (needs the Intel oneAPI base
+# toolkit, multi-GB install) and Windows CPU/CUDA/Vulkan (needs MSVC
+# layout work — Ninja Multi-Config writes to build/bin/Release/, the
+# pack script today only globs build/bin/).
 
 name: IntelNav release
 
