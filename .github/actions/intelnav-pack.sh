@@ -13,8 +13,15 @@ set -euo pipefail
 
 BACKEND="${1:?usage: intelnav-pack.sh <backend-tag>}"
 
-if [[ ! -d build/bin ]]; then
-    echo "intelnav-pack: build/bin missing — did cmake --build run?" >&2
+# Single-config generators (Makefile, Ninja) write to build/bin/.
+# Multi-config generators (Visual Studio, Ninja Multi-Config) write
+# to build/bin/<Config>/. Prefer the multi-config layout if present.
+if [[ -d build/bin/Release ]]; then
+    BIN_SRC="build/bin/Release"
+elif [[ -d build/bin ]]; then
+    BIN_SRC="build/bin"
+else
+    echo "intelnav-pack: neither build/bin/Release/ nor build/bin/ exists — did cmake --build run?" >&2
     exit 1
 fi
 
@@ -28,11 +35,11 @@ rm -rf "${DIST}"
 mkdir -p "${PKG_ROOT}/bin" "${PKG_ROOT}/include"
 
 # --- shared libraries ----------------------------------------------------
-# Copy every .so / .dylib / .dll in build/bin. ggml ships multiple libs
-# per build (base, cpu, backend-specific) and their exact set varies
-# across cmake configurations, so we glob rather than name them.
+# Copy every .so / .dylib / .dll in the build dir. ggml ships multiple
+# libs per build (base, cpu, backend-specific) and their exact set
+# varies across cmake configurations, so we glob rather than name them.
 shopt -s nullglob
-for f in build/bin/*.so build/bin/*.so.* build/bin/*.dylib build/bin/*.dll; do
+for f in "${BIN_SRC}"/*.so "${BIN_SRC}"/*.so.* "${BIN_SRC}"/*.dylib "${BIN_SRC}"/*.dll; do
     cp -a "$f" "${PKG_ROOT}/bin/"
 done
 shopt -u nullglob
