@@ -160,8 +160,9 @@ jobs:
 
   # ---------------------------------------------------------------------
   # linux-x64 ROCm — AMD Radeon (gfx9+) acceleration, the headline
-  # IntelNav win. The user's RX 6600 (gfx1032) is covered by setting
-  # AMDGPU_TARGETS to include gfx1030 (handles gfx1031/1032 via override).
+  # IntelNav win. AMDGPU_TARGETS covers every shipping Radeon arch
+  # IntelNav users are realistically running, with native bytecode for
+  # each so no HSA_OVERRIDE_GFX_VERSION dance is required at runtime.
   # ---------------------------------------------------------------------
   linux-x64-rocm:
     runs-on: ubuntu-22.04
@@ -212,11 +213,19 @@ jobs:
 
       - name: Configure
         env:
-          # gfx1030 bytecode is binary-compatible with gfx1031/1032 via
-          # HSA_OVERRIDE_GFX_VERSION=10.3.0 at run time — one artifact
-          # covers the RX 6600 / 6700 / 6800 family. Add more archs
-          # here as we get hardware to test on.
-          AMDGPU_TARGETS: "gfx900;gfx906;gfx908;gfx90a;gfx1030;gfx1100"
+          # Native bytecode for every shipping Radeon arch we'd plausibly
+          # see in IntelNav users' machines. Build cost is ~30 % more
+          # than a narrow target list, but the resulting tarball runs
+          # without HSA_OVERRIDE_GFX_VERSION on any of them. The runtime
+          # `gpu_compat` shim still applies as belt-and-suspenders for
+          # arches that get added to consumer-grade hardware after a
+          # given tarball was cut.
+          #   gfx9xx       — Vega + CDNA1/2/3 (radeon vii, MI50/100/200/300)
+          #   gfx103x      — RDNA2  (RX 6x00, e.g. 6600 = gfx1032)
+          #   gfx110x      — RDNA3  (RX 7x00)
+          #   gfx115x      — RDNA3.5 (Strix Point APU iGPUs)
+          #   gfx120x      — RDNA4  (RX 9x00)
+          AMDGPU_TARGETS: "gfx900;gfx906;gfx908;gfx90a;gfx942;gfx1030;gfx1031;gfx1032;gfx1100;gfx1101;gfx1102;gfx1150;gfx1151;gfx1200;gfx1201"
         run: |
           cmake -B build \
             ${{ env.CMAKE_COMMON }} \
