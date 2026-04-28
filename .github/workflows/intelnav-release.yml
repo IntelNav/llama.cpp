@@ -166,6 +166,21 @@ jobs:
   # ---------------------------------------------------------------------
   linux-x64-rocm:
     runs-on: ubuntu-22.04
+    env:
+      # Native bytecode for every shipping Radeon arch we'd plausibly
+      # see in IntelNav users' machines. Build cost is ~30 % more
+      # than a narrow target list, but the resulting tarball runs
+      # without HSA_OVERRIDE_GFX_VERSION on any of them. The runtime
+      # `gpu_compat` shim still applies as belt-and-suspenders for
+      # arches that get added to consumer-grade hardware after a
+      # given tarball was cut. Set here at job scope so the post-Build
+      # verification step can diff against what landed in the binary.
+      #   gfx9xx       — Vega + CDNA1/2/3 (radeon vii, MI50/100/200/300)
+      #   gfx103x      — RDNA2  (RX 6x00, e.g. 6600 = gfx1032)
+      #   gfx110x      — RDNA3  (RX 7x00)
+      #   gfx115x      — RDNA3.5 (Strix Point APU iGPUs)
+      #   gfx120x      — RDNA4  (RX 9x00)
+      AMDGPU_TARGETS: "gfx900;gfx906;gfx908;gfx90a;gfx942;gfx1030;gfx1031;gfx1032;gfx1100;gfx1101;gfx1102;gfx1150;gfx1151;gfx1200;gfx1201"
     steps:
       - uses: actions/checkout@v6
         with: { fetch-depth: 0 }
@@ -212,20 +227,6 @@ jobs:
           evict-old-files: 1d
 
       - name: Configure
-        env:
-          # Native bytecode for every shipping Radeon arch we'd plausibly
-          # see in IntelNav users' machines. Build cost is ~30 % more
-          # than a narrow target list, but the resulting tarball runs
-          # without HSA_OVERRIDE_GFX_VERSION on any of them. The runtime
-          # `gpu_compat` shim still applies as belt-and-suspenders for
-          # arches that get added to consumer-grade hardware after a
-          # given tarball was cut.
-          #   gfx9xx       — Vega + CDNA1/2/3 (radeon vii, MI50/100/200/300)
-          #   gfx103x      — RDNA2  (RX 6x00, e.g. 6600 = gfx1032)
-          #   gfx110x      — RDNA3  (RX 7x00)
-          #   gfx115x      — RDNA3.5 (Strix Point APU iGPUs)
-          #   gfx120x      — RDNA4  (RX 9x00)
-          AMDGPU_TARGETS: "gfx900;gfx906;gfx908;gfx90a;gfx942;gfx1030;gfx1031;gfx1032;gfx1100;gfx1101;gfx1102;gfx1150;gfx1151;gfx1200;gfx1201"
         run: |
           cmake -B build \
             ${{ env.CMAKE_COMMON }} \
@@ -238,6 +239,36 @@ jobs:
 
       - name: Build
         run: cmake --build build -j $(nproc) --target llama
+
+      - name: Verify gfx targets compiled into libggml-hip.so
+        # Catches the v0.1.2 mistake where AMDGPU_TARGETS edits weren't
+        # committed before the tag fired and the tarball shipped with
+        # the stale arch list. We extract every gfx string baked into
+        # the .so, diff against the configured targets, fail loudly
+        # if any are missing.
+        run: |
+          set -euo pipefail
+          SO=$(find build -name 'libggml-hip.so' -type f | head -1)
+          if [ -z "$SO" ]; then
+            echo "::error::libggml-hip.so not found under build/"; exit 1
+          fi
+          echo "Inspecting $SO"
+          BAKED=$(strings "$SO" | grep -oE 'gfx[0-9]+[a-z]*' | sort -u | tr '\n' ' ')
+          echo "baked archs: $BAKED"
+          MISSING=()
+          IFS=';' read -ra WANT <<< "$AMDGPU_TARGETS"
+          for arch in "${WANT[@]}"; do
+            if ! echo "$BAKED" | grep -qw "$arch"; then
+              MISSING+=("$arch")
+            fi
+          done
+          if [ ${#MISSING[@]} -ne 0 ]; then
+            echo "::error::libggml-hip.so is missing target(s): ${MISSING[*]}"
+            echo "::error::expected: ${WANT[*]}"
+            echo "::error::baked:    $BAKED"
+            exit 1
+          fi
+          echo "✓ every requested gfx target is in the binary"
 
       - name: Package
         run: .github/actions/intelnav-pack.sh linux-x64-rocm
